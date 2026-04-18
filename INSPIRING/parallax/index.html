@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Brote 3D con depth map</title>
+  <style>
+    :root {
+      --bg: #0e140d;
+      --panel: rgba(10, 16, 10, 0.34);
+      --text: rgba(255,255,255,0.92);
+      --muted: rgba(255,255,255,0.72);
+      --border: rgba(255,255,255,0.10);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      font-family: Inter, system-ui, Arial, sans-serif;
+      color: var(--text);
+    }
+
+    #app {
+      position: fixed;
+      inset: 0;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .overlay {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at 52% 10%, rgba(255,220,126,0.24), transparent 26%),
+        radial-gradient(circle at 48% 52%, transparent 52%, rgba(0,0,0,0.32) 100%);
+      mix-blend-mode: screen;
+    }
+
+    .ui {
+      position: fixed;
+      left: 24px;
+      bottom: 24px;
+      z-index: 10;
+      width: min(420px, calc(100vw - 48px));
+      padding: 16px 18px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      backdrop-filter: blur(12px);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+    }
+
+    .ui h1 {
+      margin: 0 0 6px 0;
+      font-size: clamp(1.2rem, 2vw, 1.7rem);
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+    }
+
+    .ui p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.42;
+      font-size: 0.97rem;
+    }
+
+    .badge {
+      display: inline-block;
+      margin-top: 12px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.12);
+      color: rgba(255,255,255,0.82);
+      font-size: 0.82rem;
+      background: rgba(255,255,255,0.04);
+    }
+
+    .hint {
+      position: fixed;
+      right: 18px;
+      top: 18px;
+      z-index: 10;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(0,0,0,0.26);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.76);
+      font-size: 0.84rem;
+      backdrop-filter: blur(10px);
+      pointer-events: none;
+    }
+
+    @media (max-width: 720px) {
+      .ui { left: 14px; right: 14px; bottom: 14px; width: auto; }
+      .hint { right: 12px; top: 12px; font-size: 0.78rem; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div class="overlay"></div>
+
+  <div class="hint">mueve el ratón</div>
+
+  <div class="ui">
+    <h1>Brote con ilusión 3D real</h1>
+    <p>Esta versión usa un <strong>depth map</strong> y una malla deformada en WebGL. No es un simple parallax por capas: la foto adquiere volumen y responde con inercia al movimiento.</p>
+    <div class="badge">Three.js + geometría desplazada</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js';
+
+    const container = document.getElementById('app');
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.8));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0e140d);
+
+    const camera = new THREE.PerspectiveCamera(38, window.innerWidth / window.innerHeight, 0.1, 20);
+    camera.position.set(0, 0, 3.15);
+
+    const loader = new THREE.TextureLoader();
+    const colorTex = loader.load('sprout.jpg', initIfReady);
+    const depthTex = loader.load('depth.png', initIfReady);
+    colorTex.colorSpace = THREE.SRGBColorSpace;
+    colorTex.minFilter = THREE.LinearFilter;
+    colorTex.magFilter = THREE.LinearFilter;
+    depthTex.minFilter = THREE.LinearFilter;
+    depthTex.magFilter = THREE.LinearFilter;
+
+    let mesh;
+    let readyCount = 0;
+    const target = new THREE.Vector2(0, 0);
+    const current = new THREE.Vector2(0, 0);
+
+    const clock = new THREE.Clock();
+
+    function initIfReady() {
+      readyCount += 1;
+      if (readyCount < 2 || mesh) return;
+
+      const geometry = new THREE.PlaneGeometry(1, 1, 360, 240);
+
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          uMap: { value: colorTex },
+          uDepth: { value: depthTex },
+          uDepthScale: { value: 0.52 },
+          uParallax: { value: 0.06 },
+          uLightDir: { value: new THREE.Vector3(-0.3, 0.6, 1.0).normalize() },
+          uTime: { value: 0 }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          varying vec3 vNormalApprox;
+          varying float vDepth;
+          uniform sampler2D uDepth;
+          uniform float uDepthScale;
+          uniform float uTime;
+
+          void main() {
+            vUv = uv;
+
+            float d = texture2D(uDepth, uv).r;
+            vDepth = d;
+
+            float dL = texture2D(uDepth, uv + vec2(-0.0025, 0.0)).r;
+            float dR = texture2D(uDepth, uv + vec2( 0.0025, 0.0)).r;
+            float dD = texture2D(uDepth, uv + vec2(0.0, -0.0025)).r;
+            float dU = texture2D(uDepth, uv + vec2(0.0,  0.0025)).r;
+
+            vec3 displaced = position;
+            displaced.z += (d - 0.08) * uDepthScale;
+
+            float sway = sin(uTime * 0.65 + uv.y * 5.0) * 0.0018 * smoothstep(0.45, 0.95, d);
+            displaced.x += sway;
+
+            vec3 dx = vec3(1.0, 0.0, (dR - dL) * uDepthScale * 18.0);
+            vec3 dy = vec3(0.0, 1.0, (dU - dD) * uDepthScale * 18.0);
+            vNormalApprox = normalize(cross(dx, dy));
+
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
+          }
+        `,
+        fragmentShader: `
+          varying vec2 vUv;
+          varying vec3 vNormalApprox;
+          varying float vDepth;
+          uniform sampler2D uMap;
+          uniform sampler2D uDepth;
+          uniform vec3 uLightDir;
+          uniform float uParallax;
+
+          void main() {
+            vec3 normal = normalize(vNormalApprox);
+            float facing = clamp(dot(normal, normalize(uLightDir)), 0.0, 1.0);
+
+            vec2 uv = vUv;
+            vec4 color = texture2D(uMap, uv);
+
+            float depthBoost = smoothstep(0.35, 1.0, vDepth);
+            color.rgb *= 0.92 + facing * 0.10 + depthBoost * 0.03;
+
+            float vignette = smoothstep(0.95, 0.25, distance(vUv, vec2(0.5)));
+            color.rgb *= mix(0.88, 1.02, vignette);
+
+            gl_FragColor = color;
+          }
+        `
+      });
+
+      mesh = new THREE.Mesh(geometry, material);
+      scene.add(mesh);
+
+      const ambient = new THREE.AmbientLight(0xffffff, 0.25);
+      scene.add(ambient);
+
+      updateCoverScale();
+    }
+
+    function updateCoverScale() {
+      if (!mesh) return;
+
+      const imageAspect = 1536 / 1024;
+      const distance = camera.position.z;
+      const viewHeight = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * distance;
+      const viewWidth = viewHeight * camera.aspect;
+
+      let planeWidth, planeHeight;
+      if (camera.aspect > imageAspect) {
+        planeWidth = viewWidth * 1.04;
+        planeHeight = planeWidth / imageAspect;
+      } else {
+        planeHeight = viewHeight * 1.04;
+        planeWidth = planeHeight * imageAspect;
+      }
+      mesh.scale.set(planeWidth, planeHeight, 1);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      updateCoverScale();
+    });
+
+    const setPointer = (clientX, clientY) => {
+      const nx = clientX / window.innerWidth - 0.5;
+      const ny = clientY / window.innerHeight - 0.5;
+      target.set(nx * 2, ny * 2);
+    };
+
+    window.addEventListener('mousemove', (e) => setPointer(e.clientX, e.clientY), { passive: true });
+
+    window.addEventListener('touchmove', (e) => {
+      if (!e.touches.length) return;
+      setPointer(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: true });
+
+    window.addEventListener('mouseleave', () => {
+      target.set(0, 0);
+    });
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+
+      current.lerp(target, 0.055);
+
+      if (mesh) {
+        mesh.material.uniforms.uTime.value = t;
+
+        mesh.rotation.y = current.x * 0.11;
+        mesh.rotation.x = -current.y * 0.07;
+
+        camera.position.x = current.x * 0.18;
+        camera.position.y = -current.y * 0.12;
+        camera.lookAt(0, 0, 0);
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>
